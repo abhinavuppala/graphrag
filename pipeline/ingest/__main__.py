@@ -22,8 +22,8 @@ def main() -> None:
     )
     parser.add_argument("url", help="GitHub repository URL")
     parser.add_argument(
-        "--output-dir", default="graphrag/input",
-        help="Where to write .txt files (default: graphrag/input)",
+        "--workspace", default="graphrag",
+        help="GraphRAG workspace root (default: graphrag). Input files go to <workspace>/input/",
     )
     parser.add_argument(
         "--clone-dir", default=None,
@@ -43,12 +43,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    load_dotenv("graphrag/.env")
+    load_dotenv(Path(args.workspace) / ".env")
     api_key = os.environ.get("GRAPHRAG_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        sys.exit("Error: GRAPHRAG_API_KEY not set. Add to graphrag/.env or export it.")
+        sys.exit("Error: GRAPHRAG_API_KEY not set. Add to <workspace>/.env or export it.")
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.workspace) / "input"
     clone_root = Path(args.clone_dir) if args.clone_dir else None
 
     print("=== Phase 1: Ingestion ===")
@@ -86,7 +86,7 @@ def main() -> None:
     report_path = output_dir / "selection_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"\nSelection report: {report_path}")
-    print(f"\nNext: graphrag index --root ./graphrag")
+    print(f"\nNext: python -m pipeline.config --workspace {args.workspace}")
 
 
 if __name__ == "__main__":

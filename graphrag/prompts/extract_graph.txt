@@ -1,0 +1,388 @@
+
+-Goal-
+Given a text document that is potentially relevant to this activity and a list of entity types, identify all entities of those types from the text and all relationships among the identified entities.
+
+-Steps-
+1. Identify all entities. For each identified entity, extract the following information:
+- entity_name: Name of the entity, capitalized
+- entity_type: One of the following types: [function, message, error, protocol, account, stream, subject, subscription, consumer, request, configuration, state, system, consumer assignment, callback]
+- entity_description: Comprehensive description of the entity's attributes and activities
+Format each entity as ("entity"<|><entity_name><|><entity_type><|><entity_description>)
+
+2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly related* to each other.
+For each pair of related entities, extract the following information:
+- source_entity: name of the source entity, as identified in step 1
+- target_entity: name of the target entity, as identified in step 1
+- relationship_description: explanation as to why you think the source entity and the target entity are related to each other
+- relationship_strength: an integer score between 1 to 10, indicating strength of the relationship between the source entity and target entity
+Format each relationship as ("relationship"<|><source_entity><|><target_entity><|><relationship_description><|><relationship_strength>)
+
+3. Return output in English as a single list of all the entities and relationships identified in steps 1 and 2. Use **##** as the list delimiter.
+
+4. If you have to translate into English, just translate the descriptions, nothing else!
+
+5. When finished, output <|COMPLETE|>.
+
+-Examples-
+######################
+
+Example 1:
+
+entity_types: [function, message, error, protocol, account, stream, subject, subscription, consumer, request, configuration, state, system, consumer assignment, callback]
+text:
+ ok := ms.removeMsg(sm.seq, false); ok {{
+					purged++
+					if purged >= ss.Msgs {{
+						break
+					}}
+				}}
+			}}
+		}}
+		ms.mu.Unlock()
+	}}
+	return purged, nil
+}}
+
+// Purge will remove all messages from this store.
+// Will return the number of purged messages.
+func (ms *memStore) Purge() (uint64, error) {{
+	return ms.purge(0)
+}}
+
+func (ms *memStore) purge(fseq uint64) (uint64, error) {{
+	ms.mu.Lock()
+	purged := uint64(len(ms.msgs))
+	cb := ms.scb
+	bytes := int64(ms.state.Bytes)
+	if fseq == 0 {{
+		fseq = ms.state.LastSeq + 1
+	}} else if fseq < ms.state.LastSeq {{
+		ms.mu.Unlock()
+		return 0, fmt.Errorf("partial purges not supported on memory store")
+	}}
+	ms.state.FirstSeq = fseq
+	ms.state.LastSeq = fseq - 1
+	ms.state.FirstTime = time.Time{{}}
+	ms.state.Bytes = 0
+	ms.state.Msgs = 0
+	if ms.msgs != nil {{
+		ms.msgs = make(map[uint64]*StoreMsg)
+	}}
+	ms.fss = stree.NewSubjectTree[SimpleState]()
+	ms.dmap.Empty()
+	ms.sdm.empty()
+	ms.mu.Unlock()
+
+	if cb != nil {{
+		cb(-int64(purged), -bytes, 0, _EMPTY_)
+	}}
+
+	return purged, nil
+}}
+
+// Compact will remove all messages from this store up to
+// but not including the seq parameter.
+// Will return the number of purged messages.
+func (ms *memStore) Compact(seq uint64) (uint64, error) {{
+	return ms.compact(seq)
+}}
+
+func (ms *memStore) compact(seq uint64) (uint64, error) {{
+	if seq == 0 {{
+		return ms.Purge()
+	}}
+
+	var purged, bytes uint64
+
+	ms.mu.Lock()
+	// Short-circuit if the store was already compacted past this point.
+	if ms.state.FirstSeq > seq {{
+		ms.mu.Unlock()
+		return purged, nil
+	}}
+
+	cb := ms.scb
+	if seq <= ms.state.LastSeq {{
+		fseq := ms.state.FirstSeq
+		// Determine new first sequence.
+		for ; seq <= ms.state.LastSeq; seq++ {{
+			if sm, ok := ms.msgs[seq]; ok {{
+				ms.state.FirstSeq = seq
+				ms.state.FirstTime = time.Unix(0, sm.ts).UTC()
+				break
+			}}
+		}}
+		for seq := seq - 1; seq >= fseq; seq-- {{
+			if sm := ms.msgs[seq]; sm != nil {{
+				bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+				purged++
+				ms.removeSeqPerSubject(sm.subj, seq)
+				// Must delete message after updating per-subject info, to be consistent with file store.
+				delete(ms.msgs, seq)
+			}} else if !ms.dmap.IsEmpty() {{
+				ms.dmap.Delete(seq)
+			}}
+		}}
+		if purged > ms.state.Msgs {{
+			purged = ms.state.Msgs
+		}}
+		ms.state.Msgs -= purged
+		if bytes > ms.state.Bytes {{
+			bytes = ms.state.Bytes
+		}}
+		ms.state.Bytes -= bytes
+	}} else {{
+		// We are compacting past the end of our range. Do purge and set sequences correctly
+		// such that the next message placed will have seq.
+		purged = uint64(len(ms.msgs))
+		bytes = ms.state.Bytes
+		ms.state.Bytes = 0
+		ms.state.Msgs = 0
+		ms.state.FirstSeq = seq
+		ms.state.FirstTime = time.Time{{}}
+		ms.state.LastSeq = seq - 1
+		// Reset msgs, fss and dmap.
+		ms.msgs = make(map[uint64]*StoreMsg)
+		ms.fss = stree.NewSubjectTree[SimpleState]()
+		ms.dmap.Empty()
+		ms.sdm.empty()
+	}}
+	ms.mu.Unlock()
+
+	if cb != nil {{
+		cb(-int64(purged), -int64(bytes), 0, _EMPTY_)
+	}}
+
+	return purged, nil
+}}
+
+// Will completely reset our store.
+func (ms *memStore) reset() error {{
+	ms.mu.Lock()
+	var purged, bytes uint64
+	cb := ms.scb
+	if cb != nil {{
+		for _, sm := range ms.msgs {{
+			purged++
+			bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+		}}
+	}}
+
+	// Reset
+	ms.state.FirstSeq = 0
+	ms.state.FirstTime = time.Time{{}}
+	ms.state.LastSeq = 0
+	ms.state.LastTime = time.Now().UTC()
+	// Update msgs and bytes.
+	ms.state.Msgs = 0
+	ms.state.Bytes = 0
+	// Reset msgs, fss and dmap.
+	ms.msgs = make(map[uint64]*StoreMsg)
+	ms.fss = stree.NewSubjectTree[SimpleState]()
+	ms.dmap.Empty()
+	ms.sdm.empty()
+
+	ms.mu.Unlock()
+
+	if cb != nil {{
+		cb(-int64(purged), -int64(bytes), 0, _EMPTY_)
+	}}
+
+	return nil
+}}
+
+// Truncate will truncate a stream store up to seq. Sequence needs to be valid.
+func (ms *memStore) Truncate(seq uint64) error {{
+	// Check for request to reset.
+	if seq == 0 {{
+		return
+------------------------
+output:
+("entity"<|>CONSUMER ASSIGNMENT<|>function<|>Represents the assignment of a consumer to a stream which manages its lifecycle and operations within a message processing architecture.)
+##
+("entity"<|>SERVER<|>system<|>A service managing consumer assignments, providing functionalities for consumer creation, deletion, and stream handling in a JetStream setup.)
+##
+("entity"<|>JETSTREAM<|>system<|>A system that involves managing streams, consumers, and supervision of message delivery and state management within distributed services.)
+##
+("entity"<|>CONSUMER<|>function<|>Represents a component that processes messages from a specific stream, handling incoming data and triggering relevant actions based on business logic.)
+##
+("entity"<|>ACCOUNT<|>function<|>Refers to user accounts within the JetStream that own streams and can manage consumer assignments and configurations.)
+##
+("relationship"<|>SERVER<|>JETSTREAM<|>The server manages consumer assignments and processes associated with the JetStream architecture.<|>8)
+##
+("relationship"<|>CONSUMER ASSIGNMENT<|>CONSUMER<|>A consumer assignment signifies the connection between an assigned consumer and the messages it is responsible for processing.<|>9)
+##
+("relationship"<|>ACCOUNT<|>CONSUMER ASSIGNMENT<|>An account is associated with consumer assignments, indicating ownership and management of specific consumer entities.<|>7)
+##
+("relationship"<|>ACCOUNT<|>SERVER<|>The server handles various accounts which in turn manage consumers and stream assignments in the JetStream architecture.<|>6)
+<|COMPLETE|>
+#############################
+
+
+Example 2:
+
+entity_types: [function, message, error, protocol, account, stream, subject, subscription, consumer, request, configuration, state, system, consumer assignment, callback]
+text:
+_, nil, nil, 0, 0, false, errBadStreamMsg
+	}}
+	hl := int(le.Uint16(buf))
+	buf = buf[2:]
+	if len(buf) < hl {{
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
+	}}
+	if hdr = buf[:hl]; len(hdr) == 0 {{
+		hdr = nil
+	}}
+	buf = buf[hl:]
+	if len(buf) < 4 {{
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
+	}}
+	ml := int(le.Uint32(buf))
+	buf = buf[4:]
+	if len(buf) < ml {{
+		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
+	}}
+	if msg = buf[:ml]; len(msg) == 0 {{
+		msg = nil
+	}}
+	buf = buf[ml:]
+	if len(buf) > 0 {{
+		flags, _ := binary.Uvarint(buf)
+		sourced = flags&msgFlagFromSourceOrMirror != 0
+	}}
+	return subject, reply, hdr, msg, lseq, ts, sourced, nil
+}}
+
+func decodeBatchMsg(buf []byte) (batchId string, batchSeq uint64, op entryOp, mbuf []byte, err error) {{
+	var le = binary.LittleEndian
+	if len(buf) < 2 {{
+		return _EMPTY_, 0, 0, nil, errBadStreamMsg
+	}}
+	bl := int(le.Uint16(buf))
+	buf = buf[2:]
+	if len(buf) < bl {{
+		return _EMPTY_, 0, 0, nil, errBadStreamMsg
+	}}
+	batchId = string(buf[:bl])
+	buf = buf[bl:]
+	var n int
+	batchSeq, n = binary.Uvarint(buf)
+	if n <= 0 {{
+		return _EMPTY_, 0, 0, nil, errBadStreamMsg
+	}}
+	buf = buf[n:]
+	op = entryOp(buf[0])
+	mbuf = buf[1:]
+	return batchId, batchSeq, op, mbuf, nil
+}}
+
+// Flags for encodeStreamMsg/decodeStreamMsg.
+const (
+	msgFlagFromSourceOrMirror uint64 = 1 << iota
+)
+
+func encodeStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, sourced bool) []byte {{
+	return encodeStreamMsgAllowCompress(subject, reply, hdr, msg, lseq, ts, sourced)
+}}
+
+func encodeStreamMsgAllowCompress(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, sourced bool) []byte {{
+	return encodeStreamMsgAllowCompressAndBatch(subject, reply, hdr, msg, lseq, ts, sourced, _EMPTY_, 0, false)
+}}
+
+// Threshold for compression.
+// TODO(dlc) - Eventually make configurable.
+const compressThreshold = 8192 // 8k
+
+// If allowed and contents over the threshold we will compress.
+func encodeStreamMsgAllowCompressAndBatch(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, sourced bool, batchId string, batchSeq uint64, batchCommit bool) []byte {{
+	// Clip the subject, reply, header and msgs down. Operate on
+	// uint64 lengths to avoid overflowing.
+	slen := min(uint64(len(subject)), math.MaxUint16)
+	rlen := min(uint64(len(reply)), math.MaxUint16)
+	hlen := min(uint64(len(hdr)), math.MaxUint16)
+	mlen := min(uint64(len(msg)), math.MaxUint32)
+	total := slen + rlen + hlen + mlen
+
+	shouldCompress := total > compressThreshold
+	elen := int(1 + 8 + 8 + total)
+	elen += (2 + 2 + 2 + 4 + 8) // Encoded lengths, 4bytes, flags are up to 8 bytes
+
+	blen := min(uint64(len(batchId)), math.MaxUint16)
+	if batchId != _EMPTY_ {{
+		elen += int(2 + blen + 8) // length of batchId, batchId itself, batchSeq (up to 8 bytes)
+	}}
+
+	var flags uint64
+	if sourced {{
+		flags |= msgFlagFromSourceOrMirror
+	}}
+
+	var le = binary.LittleEndian
+	var opIndex int
+	buf := make([]byte, 1, elen)
+	if batchId != _EMPTY_ {{
+		if batchCommit {{
+			buf[0] = byte(batchCommitMsgOp)
+		}} else {{
+			buf[0] = byte(batchMsgOp)
+		}}
+		buf = le.AppendUint16(buf, uint16(blen))
+		buf = append(buf, batchId[:blen]...)
+		buf = binary.AppendUvarint(buf, batchSeq)
+		opIndex = len(buf)
+		buf = append(buf, byte(streamMsgOp))
+	}} else {{
+		buf[opIndex] = byte(streamMsgOp)
+	}}
+
+	buf = le.AppendUint64(buf, lseq)
+	buf = le.AppendUint64(buf, uint64(ts))
+	buf = le.AppendUint16(buf, uint16(slen))
+	buf = append(buf, subject[:slen]...)
+	buf = le.AppendUint16(buf, uint16(rlen))
+	buf = append(buf, reply[:rlen]...)
+	buf = le.AppendUint16(buf, uint16(hlen))
+	buf = append(buf, hdr[:hlen]...)
+	buf = le.AppendUint32(buf, uint32(mlen))
+	buf = append(buf, msg[:mlen]...)
+	buf = binary.AppendUvar
+------------------------
+output:
+("entity"<|>CONSUMER ASSIGNMENT<|>function<|>The Consumer Assignment represents a consumer's registration to a stream and includes details regarding its state and configuration.)
+##
+("entity"<|>JETSTREAM<|>system<|>JetStream is a system for managing streams and consumers in a messaging system, which supports durable message delivery and message persistence.)
+##
+("entity"<|>STREAM<|>stream<|>A Stream is a collection of messages that can be produced and consumed, with specific retention policies and configurations.)
+##
+("entity"<|>ACCOUNT<|>account<|>An Account manages configurations and limits around stream and consumer usage within the messaging system.)
+##
+("entity"<|>ERROR<|>error<|>An Error signifies issues that occur within the system, such as lookup failures or unsupported actions.)
+##
+("entity"<|>SERVER<|>system<|>The Server hosts the JetStream system, managing consumer assignments, message delivery, and other related tasks.)
+##
+("relationship"<|>CONSUMER ASSIGNMENT<|>JETSTREAM<|>The Consumer Assignment operates within the JetStream system to manage the state and lifecycle of consumer registrations.<|>8)
+##
+("relationship"<|>STREAM<|>CONSUMER ASSIGNMENT<|>The Consumer Assignment is linked to a Stream as it represents the consumer's association with the stream for message consumption.<|>7)
+##
+("relationship"<|>ACCOUNT<|>CONSUMER ASSIGNMENT<|>The Consumer Assignment is managed under a specific Account, which delineates its configuration and operational context.<|>6)
+##
+("relationship"<|>ERROR<|>CONSUMER ASSIGNMENT<|>Errors can occur during operations involving Consumer Assignments, such as failures in registration or removal.<|>5)
+##
+("relationship"<|>SERVER<|>JETSTREAM<|>The Server provides the infrastructure for the JetStream system, enabling the operation of consumers and streams.<|>9)
+##
+("relationship"<|>STREAM<|>JETSTREAM<|>Streams are a feature of the JetStream system, allowing for message organization and persistence.<|>8)
+##
+("relationship"<|>ACCOUNT<|>JETSTREAM<|>The JetStream system is governed by Accounts that enforce limits and configurations for its usage.<|>6)
+## 
+("relationship"<|>SERVER<|>ACCOUNT<|>The Server manages Accounts to track configurations and resource limits within the JetStream system.<|>7)
+<|COMPLETE|>
+#############################
+
+
+
+-Real Data-
+######################
+entity_types: [function, message, error, protocol, account, stream, subject, subscription, consumer, request, configuration, state, system, consumer assignment, callback]
+text: {input_text}
+######################
+output:

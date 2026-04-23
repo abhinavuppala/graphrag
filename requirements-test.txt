@@ -2,4 +2,5 @@ tiktoken
 json_repair
 openai
 python-dotenv
+pyyaml
 pytest
