@@ -207,6 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 CLAUDE.md
+.claude/
 
 # GraphRAG (only commit settings.yaml and prompts)
 graphrag/output/
